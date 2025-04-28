@@ -1,0 +1,192 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_system.h> 
+#include <mbedtls/sha256.h> //for hashing
+#include <FS.h>
+#include <SPIFFS.h> //file storage
+#include <ESPmDNS.h>
+
+// hybrid entropy generator!!! 
+
+
+const char* ssid = "user";
+const char* password = "pass";
+
+WebServer server(80); //host webserver
+const int muscleSensorPin = A0;
+const int ENTROPY_POOL_SIZE = 32; //32-byte memory to gather bits
+uint8_t entropyPool[ENTROPY_POOL_SIZE];
+int poolIndex = 0;
+unsigned long lastRefreshTime = 0; //keeps track of time since it last saved
+const unsigned long refreshInterval = 2000;
+
+void connectToWiFi() {
+  Serial.println("\nConnecting to WiFi...");
+  WiFi.begin(ssid, password);
+
+  unsigned long startAttemptTime = millis();
+  const unsigned long timeout = 30000; // 30-second timeout
+
+  while (WiFi.status() != WL_CONNECTED && 
+         millis() - startAttemptTime < timeout) {
+    delay(500);
+    Serial.print(".");
+    addToEntropyPool();
+  }
+
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nFailed to connect to WiFi!");
+  
+  } else {
+    Serial.println("\nConnected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  }
+}
+// entropy collection
+void addToEntropyPool() {
+  static unsigned long lastMicros = 0; 
+  unsigned long currentMicros = micros(); //microsend resolution clock. delays cause timing jitter, this uses that entropy as well
+  int sensorValue = analogRead(muscleSensorPin); //reads the analog voltage
+
+    
+    if(sensorValue < 50 || sensorValue > 4000) { 
+    sensorValue = esp_random();
+    } 
+  /*if the muscle sensor is off or other noise causes it to shoot up drastically, it falls back to the hardware RNG. 
+  this is to maintain randomness and ensure secure values, although i should test this code without this in place to 
+  see how effective the muscle sensor is on its own? */
+  
+  // mix sensor value with timing noise and hardware RNG using XOR. only takes 8 bits to get one byte
+  uint8_t newByte = (sensorValue ^ esp_random() ^ (currentMicros - lastMicros)) & 0xFF;
+  
+//the entropy pool is where all the values live. this XORs the new values with the previous ones so that entropy only gets better
+  entropyPool[poolIndex % ENTROPY_POOL_SIZE] ^= newByte;
+  poolIndex++;
+  lastMicros = currentMicros;
+}
+
+
+String generateRandomString() {
+  // hash the entropy pool using SHA (part of ESP32 crypto)
+  uint8_t hash[32];
+  mbedtls_sha256(entropyPool, ENTROPY_POOL_SIZE, hash, 0);
+  
+  // convert to hex string
+  String result;
+  for(int i=0; i<8; i++) { // only use first 8 bytes for demo
+    char buf[3];
+    sprintf(buf, "%02x", hash[i]);
+    result += buf;
+  }
+  
+  return result;
+}
+
+// initialize SPIFFS for file storage
+void initFS() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Error mounting SPIFFS!");
+    while (1);
+  }
+}
+
+// Save data to file
+void saveToFile(const String &filename, const String &data) {
+  File file = SPIFFS.open(filename, FILE_APPEND);
+  if (!file) {
+    Serial.println("Failed to open file for writing");
+    return;
+  }
+  if (file.println(data)) {
+    Serial.println("Data saved: " + data);
+  } else {
+    Serial.println("Write failed");
+  }
+  file.close();
+}
+
+void setup() {
+  Serial.begin(115200);
+  initFS();
+  Serial.println("\nSPIFFS Contents:");
+File root = SPIFFS.open("/");
+File file = root.openNextFile();
+while(file){
+  Serial.printf("File: %s, Size: %d\n", file.name(), file.size());
+  file = root.openNextFile();
+}
+  
+  // initialize entropy pool with hardware RNG
+  for(int i=0; i<ENTROPY_POOL_SIZE; i++) {
+    entropyPool[i] = esp_random() & 0xFF;
+  }
+  
+  WiFi.begin(ssid, password);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    addToEntropyPool(); // keep collecting during WiFi connect
+  }
+
+  server.on("/data", HTTP_GET, []() {
+    addToEntropyPool();
+    int value = analogRead(muscleSensorPin);
+    server.send(200, "application/json", "{\"muscle\":" + String(value) + "}");
+  });
+
+  server.on("/random", HTTP_GET, []() {
+    String randomStr = generateRandomString();
+    server.send(200, "application/json", "{\"random\":\"" + randomStr + "\"}");
+  });
+    server.on("/download", HTTP_GET, []() {
+    File file = SPIFFS.open("/entropy_log.txt");
+    if (!file || file.isDirectory()) {
+      server.send(404, "text/plain", "File not found");
+      return;
+    }
+    
+    server.sendHeader("Content-Type", "text/plain");
+    server.sendHeader("Content-Disposition", "attachment; filename=entropy_log.txt");
+    server.streamFile(file, "text/plain");
+    file.close();
+  });
+    server.on("/clear", HTTP_GET, []() {
+    if (SPIFFS.remove("/entropy_log.txt")) {
+      server.send(200, "text/plain", "Log file cleared successfully");
+      Serial.println("Log file cleared via web");
+    } else {
+      server.send(500, "text/plain", "Clear failed");
+    }
+
+  });
+  server.on("/start_collection", HTTP_GET, []() {
+  SPIFFS.remove("/entropy_log.txt"); // clear old data
+  server.send(200, "text/plain", "Collection started");
+});
+
+server.on("/stop_collection", HTTP_GET, []() {
+  server.send(200, "text/plain", "Collection stopped. File ready for download");
+});
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  
+  static unsigned long lastEntropyUpdate = 0;
+  if (millis() - lastEntropyUpdate > 10) { // non-blocking 10ms
+    addToEntropyPool();
+    lastEntropyUpdate = millis();
+  }
+
+  if (millis() - lastRefreshTime >= refreshInterval) {
+    lastRefreshTime = millis();
+    String randomStr = generateRandomString();
+    saveToFile("/entropy_log.txt", String(millis()) + "," + randomStr);
+  }
+}
