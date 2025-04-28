@@ -46,8 +46,7 @@ void connectToWiFi() {
 }
 // entropy collection
 void addToEntropyPool() {
-  static unsigned long lastMicros = 0; 
-  unsigned long currentMicros = micros(); //microsend resolution clock. delays cause timing jitter, this uses that entropy as well
+
   int sensorValue = analogRead(muscleSensorPin); //reads the analog voltage
 
     
@@ -58,13 +57,13 @@ void addToEntropyPool() {
   this is to maintain randomness and ensure secure values, although i should test this code without this in place to 
   see how effective the muscle sensor is on its own? */
   
-  // mix sensor value with timing noise and hardware RNG using XOR. only takes 8 bits to get one byte
-  uint8_t newByte = (sensorValue ^ esp_random() ^ (currentMicros - lastMicros)) & 0xFF;
+  // mix sensor value with hardware RNG using XOR. only takes 8 bits to get one byte
+  uint8_t newByte = (sensorValue ^ esp_random()) & 0xFF;
   
 //the entropy pool is where all the values live. this XORs the new values with the previous ones so that entropy only gets better
   entropyPool[poolIndex % ENTROPY_POOL_SIZE] ^= newByte;
   poolIndex++;
-  lastMicros = currentMicros;
+
 }
 
 
